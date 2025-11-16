@@ -19,13 +19,10 @@ from visualization_msgs.msg import Marker, MarkerArray
 from collections import deque
 from threading import Thread
 from std_msgs.msg import Bool
-
-# --- 1. NEW IMPORTS ---
 import torch
 import torchreid
 import torchvision.transforms as T
 import torch.nn.functional as F
-# ---
 
 class PepperPathFollower:
     def __init__(self):
@@ -34,19 +31,17 @@ class PepperPathFollower:
 
         self.target_status_pub = rospy.Publisher('/pepper/target_status', Bool, queue_size=1)
 
-        # --- 2. MODIFIED: Load Detector (NOT pose) and Re-ID Model ---
-        self.model = YOLO('yolov8n.pt') # Use standard detector
+        self.model = YOLO('yolov8n.pt')
         rospy.loginfo("Loading Re-ID model (osnet_x0_25)...")
         self.reid_model = torchreid.models.build_model(
             name='osnet_x0_25',
-            num_classes=1, # Not used for feature extraction
+            num_classes=1,
             pretrained=True
         )
         self.reid_model.eval()
         if torch.cuda.is_available():
             self.reid_model = self.reid_model.cuda()
 
-        # Create the image pre-processor for the Re-ID model
         self.reid_transform = T.Compose([
             T.ToPILImage(),
             T.Resize((256, 128)),
@@ -55,42 +50,36 @@ class PepperPathFollower:
         ])
         
         self.bridge = CvBridge()
-        self.known_people = {} # Now stores {id: feature_vector}
+        self.known_people = {}
         self.potential_people = {}
         self.next_person_id = 0
         
-        self.REID_MATCH_THRESHOLD = 0.6 # Cosine similarity threshold (higher is better)
+        self.REID_MATCH_THRESHOLD = 0.6
         self.CONFIDENCE_THRESHOLD = 3
         self.MIN_BBOX_AREA = 50 * 50
         self.REID_GATE_DISTANCE = 1.5
-        # --- END OF MODIFICATION ---
 
-        ### NEW: Depth Confirmation Parameters ###
-        self.DEPTH_STD_DEV_THRESHOLD = 0.05 # Min std dev (meters) to be 'not flat'
-        self.MIN_VALID_DEPTH_PERCENT = 0.1 # Min % of valid depth points needed
+        self.DEPTH_STD_DEV_THRESHOLD = 0.05
+        self.MIN_VALID_DEPTH_PERCENT = 0.1
 
-        # --- Robot Control and Navigation Setup ---
         self.cmd_pub = rospy.Publisher('/pepper/cmd_vel', Twist, queue_size=10)
         self.TURN_P_GAIN = 0.8; self.MAX_ANGULAR_SPEED = 0.4
         self.LINEAR_P_GAIN = 0.5; self.MAX_LINEAR_SPEED = 0.5
         self.DISTANCE_THRESHOLD = 0.5
-        self.WAYPOINT_TIME_THRESHOLD = rospy.Duration(0.2) # Kept your faster waypoint logging
-        self.MIN_TARGET_DISTANCE = 0.7 # Kept your closer follow distance
+        self.WAYPOINT_TIME_THRESHOLD = rospy.Duration(0.2)
+        self.MIN_TARGET_DISTANCE = 0.7
         self.BACKUP_DIST = 0.7
         self.NAVIGATION_START_DISTANCE = 1.0
 
         self.enable_visualization = rospy.get_param('~visualize', False)
 
-        ### REVERTED: Look-ahead averaging setup ###
-        self.NAVIGATION_LOOKAHEAD = 3 # How many waypoints to average for navigation (set back to a fixed value)
-        self.navigation_target_marker_id = 9997 # A unique ID for our nav target marker
+        self.NAVIGATION_LOOKAHEAD = 3
+        self.navigation_target_marker_id = 9997
         
-        ### NEW: Running Average Setup ###
-        self.VELOCITY_AVERAGE_WINDOW = 10 # Store the last 10 velocity readings
+        self.VELOCITY_AVERAGE_WINDOW = 10
         self.velocity_history = collections.deque(maxlen=self.VELOCITY_AVERAGE_WINDOW)
         self.running_average_velocity = 0.0
 
-        # --- Head Control Setup ---
         self.head_pub = rospy.Publisher('/pepper/Head_controller/command', 
                                         JointTrajectory, 
                                         queue_size=1)
@@ -108,17 +97,14 @@ class PepperPathFollower:
         self.HEAD_PITCH_MIN = rospy.get_param("~head_pitch_min", -0.7068)
         self.HEAD_PITCH_MAX = rospy.get_param("~head_pitch_max", 0.4451)
 
-        # Head smoothing
         self.SMOOTHING_FACTOR = 0.8 
         self.smoothed_head_error_x = 0.0
         self.smoothed_head_error_y = 0.0
 
-        # --- Marker Publisher Setup ---
         self.marker_pub = rospy.Publisher('/pepper/waypoint_markers', MarkerArray, queue_size=1)
         self.marker_list = []
         self.next_marker_id = 0
 
-        # --- State Machine and Path Queue ---
         self.robot_state = 'SEARCHING'
         self.last_target_seen_time = rospy.Time(0)
         self.LOST_TIMEOUT = rospy.Duration(1.0)
@@ -128,7 +114,6 @@ class PepperPathFollower:
         self.current_target_distance = None
         self.last_known_target_bbox = None
 
-        # --- TF2, Odom, and CameraInfo Setup ---
         self.tf_buffer = tf2_ros.Buffer(); self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         self.current_pos = None; self.current_yaw = 0.0
         self.camera_info = None
@@ -140,19 +125,14 @@ class PepperPathFollower:
         self.ts = message_filters.ApproximateTimeSynchronizer([color_sub, depth_sub], 10, 0.1)
         self.ts.registerCallback(self.perception_callback)
 
-        # --- Prediction Variables ---
         self.PREDICTION_TIME_SEC = 1.5
         self.last_target_odom_point = None
         self.last_target_odom_time = None
         self.last_target_velocity_odom = (0, 0)
         self.predicted_target_point = None
 
-        # --- 1. NEW: Parameter for Re-ID Gating ---
-        self.REID_GATE_DISTANCE = 0.8 # (meters) Only check people within this radius of the prediction
-        # --- END OF NEW ---
+        self.REID_GATE_DISTANCE = 0.8
 
-
-    # --- Marker Helper Functions (unchanged) ---
     def publish_delete_all_markers(self):
         delete_all_marker = Marker()
         delete_all_marker.header.frame_id = "odom"
@@ -169,7 +149,6 @@ class PepperPathFollower:
             return
         self.marker_pub.publish(MarkerArray(markers=self.marker_list))
 
-    # --- Callbacks (cam_info, joint_state, odom) (unchanged) ---
     def cam_info_callback(self, msg):
         if self.camera_info is None:
             rospy.loginfo("Camera info received.")
@@ -191,25 +170,19 @@ class PepperPathFollower:
         orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
         (_, _, self.current_yaw) = tf.transformations.euler_from_quaternion(orientation_list)
 
-    # --- 3. REPLACED: All histogram functions are replaced by this ---
-    @torch.no_grad() # Disable gradient calculation for speed
+    @torch.no_grad()
     def get_reid_features(self, crops):
-        """Extracts feature vectors from a batch of cropped images."""
         if not crops:
             return []
         
-        # Apply the transforms to each crop
         tensors = [self.reid_transform(crop) for crop in crops]
-        batch = torch.stack(tensors) # Stack into a single batch
+        batch = torch.stack(tensors)
         if torch.cuda.is_available():
             batch = batch.cuda()
         
-        # Get the feature vectors (embeddings)
         features = self.reid_model(batch)
-        # Normalize features for cosine similarity
         features = F.normalize(features, p=2, dim=1)
         return features.cpu()
-    # --- END OF REPLACEMENT ---
     
     def deproject_pixel_to_point(self, u, v, depth):
         if self.camera_info is None:
@@ -220,7 +193,6 @@ class PepperPathFollower:
         x = (u - cx) * depth / fx; y = (v - cy) * depth / fy; z = depth
         return (x, y, z)
 
-    # --- Marker Helper Functions (unchanged) ---
     def add_prediction_marker(self, predicted_point):
         prediction_marker_id = 9999
         marker = Marker()
@@ -233,7 +205,7 @@ class PepperPathFollower:
         marker.pose.position = predicted_point
         marker.pose.orientation.w = 1.0
         marker.scale.x = 0.25; marker.scale.y = 0.25; marker.scale.z = 0.25
-        marker.color.a = 0.7; marker.color.r = 0.0; marker.color.g = 0.5; marker.color.b = 1.0 # Blue
+        marker.color.a = 0.7; marker.color.r = 0.0; marker.color.g = 0.5; marker.color.b = 1.0
         marker.lifetime = rospy.Duration(5.0)
         self.marker_list.append(marker)
 
@@ -250,11 +222,10 @@ class PepperPathFollower:
         marker.pose.position.z = 0.1
         marker.pose.orientation.w = 1.0
         marker.scale.x = 0.2; marker.scale.y = 0.2; marker.scale.z = 0.2
-        marker.color.a = 0.7; marker.color.r = 1.0; marker.color.g = 1.0; marker.color.b = 0.0 # Yellow
+        marker.color.a = 0.7; marker.color.r = 1.0; marker.color.g = 1.0; marker.color.b = 0.0
         marker.lifetime = rospy.Duration(0.2)
         self.marker_list.append(marker)
 
-    # --- log_waypoint (simplified) (unchanged) ---
     def log_waypoint(self, odom_point):
         if self.current_target_distance < self.MIN_TARGET_DISTANCE:
             return 
@@ -278,36 +249,26 @@ class PepperPathFollower:
             marker.pose.position = odom_point.point
             marker.pose.orientation.w = 1.0
             marker.scale.x = 0.2; marker.scale.y = 0.2; marker.scale.z = 0.2
-            marker.color.a = 0.8; marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 0.0 # Green
+            marker.color.a = 0.8; marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 0.0
             marker.lifetime = rospy.Duration()
             
             self.marker_list.append(marker)
             self.next_marker_id += 1
 
-    # --- perception_callback (MODIFIED: Conditional Visualization) ---
     def perception_callback(self, color_msg, depth_msg):
         try:
             cv_frame = self.bridge.imgmsg_to_cv2(color_msg, "bgr8")
-            # Only create vis_frame if visualization is enabled
             vis_frame = cv_frame.copy() if self.enable_visualization else None
             depth_frame = self.bridge.imgmsg_to_cv2(depth_msg, "16UC1")
         except CvBridgeError as e:
             rospy.logerr(f"CvBridge Error: {e}"); return
 
-        # --- Run YOLO on the frame needed ---
         frame_to_process = vis_frame if self.enable_visualization else cv_frame
-        # Suppress verbose YOLO output
-        # We now run the pose model
-        # --- THIS IS THE FIX ---
-        # Changed self.model(...) to self.model.track(...)
-        # The .track() method accepts 'persist=True' and provides the track IDs
         results = self.model.track(frame_to_process, persist=True, classes=[0], verbose=False)
-        # --- END OF FIX ---
 
         target_found_this_frame = False
         confirmed_target_yolo_box_core = None
         
-        # The main results object is a list of results
         result = results[0] 
 
         predicted_target_odom = None
@@ -318,17 +279,12 @@ class PepperPathFollower:
                 self.last_target_odom_point.y + self.last_target_velocity_odom[1] * dt
             )
   
-        # --- Get Image Center ---
         H, W = cv_frame.shape[:2]
         image_center_x = W / 2
         image_center_y = H / 2
 
         if result.boxes.id is not None:
             if 0 not in self.known_people:
-            # --- (1) NEW TARGET SELECTION LOGIC (STATE: SEARCHING) ---
-            # We don't have a target yet. Find all people and pick the
-            # one closest to the center as our candidate for ID 0.
-            
                 candidates = []
                 for i, box in enumerate(result.boxes.xyxy):
                     x1, y1, x2, y2 = map(int, box)
@@ -337,11 +293,9 @@ class PepperPathFollower:
                     if (x2 - x1) * (y2 - y1) < self.MIN_BBOX_AREA:
                         continue
                     
-                    # Find Box Center
                     box_center_x = (x1 + x2) / 2
                     box_center_y = (y1 + y2) / 2
                     
-                    # Calculate Euclidean Distance from image center
                     distance = math.hypot(box_center_x - image_center_x, 
                                         box_center_y - image_center_y)
                     
@@ -349,48 +303,36 @@ class PepperPathFollower:
                         'track_id': track_id,
                         'bbox': (x1, y1, x2, y2),
                         'distance_to_center': distance,
-                        'box_obj': box # Store the original box tensor if needed
+                        'box_obj': box
                     })
                 
                 print(candidates[0])
-                # Now, sort all valid candidates by distance
                 sorted_candidates = sorted(candidates, key=lambda c: c['distance_to_center'])
                 
-                
-                # If we have any candidates, check the one closest to the center
                 if sorted_candidates:
-                    priority_1_target = sorted_candidates[0] # This is our new target
+                    priority_1_target = sorted_candidates[0]
                     track_id_c = priority_1_target['track_id']
                     
-                    # Now use your existing confidence logic on this *specific* track_id
                     self.potential_people[track_id_c] = self.potential_people.get(track_id_c, 0) + 1
                     
                     if self.potential_people[track_id_c] >= self.CONFIDENCE_THRESHOLD:
-                        # CONFIRMED! This is our new ID 0
                         x1, y1, x2, y2 = priority_1_target['bbox']
                         person_crop = cv_frame[y1:y2, x1:x2]
                         
                         if person_crop.size > 0:
                             feature_vector = self.get_reid_features([person_crop])[0].unsqueeze(0)
-                            self.known_people[0] = feature_vector # Assign ID 0
-                            self.next_person_id = 1 # Set next ID to 1
+                            self.known_people[0] = feature_vector
+                            self.next_person_id = 1
                             
                             rospy.loginfo(f"====== NEW TARGET (Center Priority) CONFIRMED! Assigned ID: 0 (Track ID: {track_id_c}) ======")
                             
-                            # We found them this frame!
                             target_found_this_frame = True
                             confirmed_target_yolo_box_core = priority_1_target['bbox']
                             
-                            # Clean up potential trackers
                             if track_id_c in self.potential_people: 
                                 del self.potential_people[track_id_c]
                             
-                            
             else:
-            # --- (2) EXISTING RE-ID LOGIC (STATE: TRACKING) ---
-            # We already have ID 0. Find them in the frame using Re-ID.
-            # (This is your original logic, slightly cleaned up)
-            
                 candidates = [] 
                 crops_to_process = [] 
 
@@ -400,10 +342,8 @@ class PepperPathFollower:
 
                     if (x2_c - x1_c) * (y2_c - y1_c) < self.MIN_BBOX_AREA: continue
 
-                    # (Your existing gating logic)
                     current_detection_odom = None
                     try:
-                        # ... (omitted get_3d_point logic for brevity) ...
                         scale_x = depth_frame.shape[1] / cv_frame.shape[1]; scale_y = depth_frame.shape[0] / cv_frame.shape[0]
                         center_x_color = (x1_c + x2_c) / 2; center_y_color = (y1_c + y2_c) / 2
                         depth_x = int(center_x_color * scale_x); depth_y = int(center_y_color * scale_y)
@@ -420,12 +360,11 @@ class PepperPathFollower:
                         if predicted_target_odom is not None:
                             dist_to_prediction = math.dist((current_detection_odom.point.x, current_detection_odom.point.y), predicted_target_odom)
                             if dist_to_prediction > self.REID_GATE_DISTANCE:
-                                continue # GATED
+                                continue
                                 
                     except Exception as e:
                         rospy.logerr_throttle(5, f"Gating Error: {e}"); continue
                     
-                    # This person is a valid, gated candidate.
                     person_crop_c = cv_frame[y1_c:y2_c, x1_c:x2_c]
                     if person_crop_c.size > 0:
                         crops_to_process.append(person_crop_c)
@@ -434,18 +373,16 @@ class PepperPathFollower:
                             'bbox': (x1_c, y1_c, x2_c, y2_c)
                         })
 
-                # --- Now, process all candidates in one batch ---
                 if crops_to_process:
                     feature_vectors = self.get_reid_features(crops_to_process)
                     
                     best_match_score = -1
                     best_match_candidate = None
-                    known_vector = self.known_people[0] # We know ID 0 exists
+                    known_vector = self.known_people[0]
 
                     for i, candidate in enumerate(candidates):
                         current_vector = feature_vectors[i].unsqueeze(0)
                         
-                        # Compare against our *one* target (ID 0)
                         score = F.cosine_similarity(current_vector, known_vector).item()
                         
                         if score > self.REID_MATCH_THRESHOLD:
@@ -454,16 +391,12 @@ class PepperPathFollower:
                                 best_match_candidate = candidate
                     
                     if best_match_candidate is not None:
-                        # We found our target!
                         target_found_this_frame = True
                         confirmed_target_yolo_box_core = best_match_candidate['bbox']
         
-        # --- Conditional Drawing ---
         if self.enable_visualization and vis_frame is not None:
-            # Use the .plot() method from the results to draw skeletons
             annotated_frame = results[0].plot()
             
-            # Add our custom target confirmation on top
             if confirmed_target_yolo_box_core is not None:
                  x1, y1, x2, y2 = confirmed_target_yolo_box_core
                  cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
@@ -473,16 +406,12 @@ class PepperPathFollower:
             cv2.imshow("Pepper Perception", annotated_frame)
             cv2.waitKey(1)
 
-
-        # --- Update state based on core logic results ---
         self.last_known_target_bbox = confirmed_target_yolo_box_core
 
-        # --- Velocity, Waypoint, State Logic (uses self.last_known_target_bbox) ---
         if target_found_this_frame:
             try:
-                # Calculations should use self.last_known_target_bbox if needed
                 if self.last_known_target_bbox:
-                    scale_x = depth_frame.shape[1] / cv_frame.shape[1] # Use original frame shape
+                    scale_x = depth_frame.shape[1] / cv_frame.shape[1]
                     scale_y = depth_frame.shape[0] / cv_frame.shape[0]
 
                     target_center_x_color = (self.last_known_target_bbox[0] + self.last_known_target_bbox[2]) / 2
@@ -520,7 +449,6 @@ class PepperPathFollower:
                     self.last_target_odom_time = current_time
                     self.log_waypoint(odom_point)
                         
-
             except Exception as e:
                 rospy.logerr(f"Error in perception 'if target_found_this_frame': {e}")
 
@@ -536,10 +464,8 @@ class PepperPathFollower:
                 self.target_status_pub.publish(status_msg)
 
         else:
-            # Target not found OR not confirmed by Depth
             self.current_target_distance = None; self.current_target_velocity_mag = 0.0
             if self.velocity_history:
-                # rospy.loginfo("Target lost/unconfirmed, resetting velocity average.")
                 self.velocity_history.clear(); self.running_average_velocity = 0.0
 
             if self.robot_state == 'TRACKING' and (rospy.Time.now() - self.last_target_seen_time > self.LOST_TIMEOUT):
@@ -555,12 +481,10 @@ class PepperPathFollower:
                     self.add_prediction_marker(self.predicted_target_point.point)
                 self.robot_state = 'NAVIGATING_PATH'
 
-        # --- Conditional Display ---
         if self.enable_visualization and vis_frame is not None:
             cv2.imshow("Pepper Perception", vis_frame)
             cv2.waitKey(1)
 
-    # --- control_loop (REVERTED to fixed look-ahead) ---
     def control_loop(self):
         rate = rospy.Rate(10)
         while not rospy.is_shutdown():
@@ -573,7 +497,6 @@ class PepperPathFollower:
             
             has_path = len(self.waypoint_queue) > 0
             
-            # 1. Independent Waypoint Dequeueing
             if has_path:
                 wp_x, wp_y, wp_id = self.waypoint_queue[0]
                 distance_to_wp = math.dist((self.current_pos.x, self.current_pos.y), (wp_x, wp_y))
@@ -590,7 +513,6 @@ class PepperPathFollower:
                     self.predicted_target_point = None
                     has_path = len(self.waypoint_queue) > 0
             
-            # 2. State Transition
             if self.robot_state == 'NAVIGATING_PATH' and not has_path:
                 rospy.logwarn("Path finished. Switching to SEARCHING state.")
                 self.robot_state = 'SEARCHING'
@@ -603,13 +525,9 @@ class PepperPathFollower:
                 status_msg.data = False
                 self.target_status_pub.publish(status_msg)
 
-            
-            # --- 4. REVERTED: Path Following (Fixed Look-ahead) ---
             if has_path:
-                # 1. ORIENTATION TARGET
                 orientation_target = self.waypoint_queue[0]
                 
-                # 2. NAVIGATION TARGET (Fixed Look-ahead)
                 num_to_get = min(len(self.waypoint_queue), self.NAVIGATION_LOOKAHEAD)
                 points_to_average = list(self.waypoint_queue)[:num_to_get]
                 
@@ -621,7 +539,6 @@ class PepperPathFollower:
                 
                 self.add_navigation_marker(navigation_target)
                 
-                # 4c. Body Orientation
                 target_x, target_y, _ = orientation_target 
                 angle_to_target = math.atan2(target_y - self.current_pos.y, target_x - self.current_pos.x)
                 angle_diff = angle_to_target - self.current_yaw
@@ -629,7 +546,6 @@ class PepperPathFollower:
                 if angle_diff < -math.pi: angle_diff += 2 * math.pi
                 move_cmd.angular.z = self.TURN_P_GAIN * angle_diff
 
-                # 4d. Body Linear Movement
                 nav_x, nav_y = navigation_target
                 distance_to_nav_target = math.dist((self.current_pos.x, self.current_pos.y), (nav_x, nav_y))
                 move_cmd.linear.x = self.LINEAR_P_GAIN * distance_to_nav_target
@@ -638,10 +554,9 @@ class PepperPathFollower:
                 if not left:
                     move_cmd.angular.z = self.SEARCH_SPEED
                 else:
-                    move_cmd.angular.z = -self.SEARCH_SPEED
-                # (Head command is already set above, no need to repeat)
+                    move_cm
+            d.angular.z = -self.SEARCH_SPEED
 
-            # --- 5. Safety Brake (Unchanged) ---
             if self.robot_state == 'TRACKING' and self.current_target_distance is not None:
                 if self.current_target_distance < self.MIN_TARGET_DISTANCE:
                     rospy.logwarn_throttle(0.5, f"Target too close ({self.current_target_distance:.2f}m)! Moving back.")
@@ -649,7 +564,6 @@ class PepperPathFollower:
                     backward_speed = self.LINEAR_P_GAIN * error_dist
                     move_cmd.linear.x = backward_speed
 
-            # --- 6. Clip and Publish ---
             move_cmd.angular.z = np.clip(move_cmd.angular.z, -self.MAX_ANGULAR_SPEED, self.MAX_ANGULAR_SPEED)
             move_cmd.linear.x = np.clip(move_cmd.linear.x, -self.MAX_LINEAR_SPEED, self.MAX_LINEAR_SPEED)
             self.cmd_pub.publish(move_cmd)
@@ -661,7 +575,6 @@ class PepperPathFollower:
             
             self.publish_markers()
             
-            # --- 8. Logging ---
             log_wp_count = len(self.waypoint_queue)
             log_tgt_dist = f"{self.current_target_distance:.2f}m" if self.current_target_distance is not None else "N/A"
             dist_to_wp = None
@@ -669,11 +582,11 @@ class PepperPathFollower:
                  dist_to_wp = math.dist((self.current_pos.x, self.current_pos.y), (self.waypoint_queue[0][0], self.waypoint_queue[0][1]))
             
             log_wp_dist = f"{dist_to_wp:.2f}m" if dist_to_wp is not None else "N/A"
-            rospy.loginfo_throttle(1.0, f"State: {self.robot_state} | WPs: {log_wp_count} | TgtDist: {log_tgt_dist} | NextWP_Dist: {log_wp_dist}")
+            rospy.loginfo_throttle(1.0, f"State: {self.robot_state} | WPs: {log_w
+            p_count} | TgtDist: {log_tgt_dist} | NextWP_Dist: {log_wp_dist}")
             
             rate.sleep()
         
-        # --- Shutdown ---
         self.cmd_pub.publish(Twist())
         
         rospy.loginfo("Resetting head to center...")
